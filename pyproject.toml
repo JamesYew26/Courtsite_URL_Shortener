@@ -1,0 +1,10 @@
+[project]
+name = "courtsite-url-shortener"
+version = "0.1.0"
+description = "URL shortener service with live URL validation, SSRF protection, and BI visit tracking."
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
