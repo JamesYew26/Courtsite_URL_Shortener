@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import socket
+import urllib.parse
+from typing import Union
+
+import httpx
+
+IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+
+_LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal")
+_USER_AGENT = "Mozilla/5.0 (compatible; CourtsiteURLShortener/1.0; +https://courtsite.my)"
+
+
+class URLValidationError(Exception):
+    """Raised when a URL fails syntax, SSRF, or reachability validation."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+def _is_restricted_ip(ip_obj: IPAddress) -> bool:
+    """Return True if an IP address belongs to a restricted or non-public range."""
+    if (
+        ip_obj.is_loopback
+        or ip_obj.is_private
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    ):
+        return True
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        return _is_restricted_ip(ip_obj.ipv4_mapped)
+    return False
+
+
+class URLValidator:
+    """Validates URL syntax, enforces SSRF protections, and checks HTTP reachability."""
+
+    def __init__(
+        self,
+        timeout: float = 5.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+        allow_private_ips: bool = False,
+    ) -> None:
+        self.timeout = timeout
+        self.transport = transport
+        self.allow_private_ips = allow_private_ips
+
+    async def _validate_host_ssrf(self, hostname: str) -> None:
+        normalized_host = hostname.lower().rstrip(".")
+        if normalized_host == "localhost" or normalized_host.endswith(_LOCAL_HOST_SUFFIXES):
+            raise URLValidationError("Access to local or internal hostnames is restricted")
+
+        try:
+            literal_ip = ipaddress.ip_address(normalized_host)
+        except ValueError:
+            literal_ip = None
+
+        if literal_ip is not None:
+            if _is_restricted_ip(literal_ip):
+                raise URLValidationError(
+                    "Access to private, local, or restricted network addresses is not allowed"
+                )
+            return
+
+        try:
+            addr_infos = await asyncio.to_thread(socket.getaddrinfo, normalized_host, None)
+        except socket.gaierror as exc:
+            raise URLValidationError(f"Could not resolve hostname: {hostname}") from exc
+
+        if not addr_infos:
+            raise URLValidationError(f"Could not resolve hostname: {hostname}")
+
+        for info in addr_infos:
+            raw_ip = info[4][0].split("%")[0]
+            try:
+                resolved_ip = ipaddress.ip_address(raw_ip)
+            except ValueError:
+                continue
+            if _is_restricted_ip(resolved_ip):
+                raise URLValidationError(
+                    "Access to private, local, or restricted network addresses is not allowed"
+                )
+
+    async def validate(self, url: str) -> str:
+        """Validate URL syntax, SSRF safety, and live HTTP reachability."""
+        normalized_url = url.strip()
+        if not normalized_url:
+            raise URLValidationError("URL cannot be empty")
+
+        parsed = urllib.parse.urlparse(normalized_url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            raise URLValidationError("URL scheme must be http or https")
+
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise URLValidationError("URL contains an invalid port") from exc
+
+        if not parsed.netloc or not parsed.hostname:
+            raise URLValidationError("URL must include a valid hostname")
+
+        initial_hostname = parsed.hostname.lower()
+        validated_hosts: set[str] = set()
+        if not self.allow_private_ips:
+            await self._validate_host_ssrf(initial_hostname)
+            validated_hosts.add(initial_hostname)
+
+        async def _guard_redirect_request(request: httpx.Request) -> None:
+            if self.allow_private_ips:
+                return
+            if request.url.scheme.lower() not in {"http", "https"}:
+                raise URLValidationError("Redirect target must use http or https scheme")
+            req_host = (request.url.host or "").lower()
+            if not req_host:
+                raise URLValidationError("Redirect target must include a valid hostname")
+            if req_host not in validated_hosts:
+                await self._validate_host_ssrf(req_host)
+                validated_hosts.add(req_host)
+
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=self.timeout,
+                transport=self.transport,
+                headers={"User-Agent": _USER_AGENT},
+                event_hooks={"request": [_guard_redirect_request]},
+            ) as client:
+                resp = await client.head(normalized_url)
+                if resp.status_code in (405, 403):
+                    async with client.stream("GET", normalized_url) as get_resp:
+                        status_code = get_resp.status_code
+                        final_url = get_resp.url
+                else:
+                    status_code = resp.status_code
+                    final_url = resp.url
+        except httpx.HTTPError as exc:
+            raise URLValidationError(f"The provided URL is not accessible: {exc}") from exc
+
+        if not self.allow_private_ips:
+            final_host = (final_url.host or "").lower()
+            if final_host and final_host not in validated_hosts:
+                await self._validate_host_ssrf(final_host)
+
+        if status_code >= 400:
+            raise URLValidationError(f"The provided URL is not accessible (HTTP {status_code})")
+
+        return normalized_url
