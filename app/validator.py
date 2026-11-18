@@ -31,6 +31,7 @@ def _is_restricted_ip(ip_obj: IPAddress) -> bool:
         or ip_obj.is_multicast
         or ip_obj.is_reserved
         or ip_obj.is_unspecified
+        or not ip_obj.is_global
     ):
         return True
     if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
@@ -70,7 +71,7 @@ class URLValidator:
 
         try:
             addr_infos = await asyncio.to_thread(socket.getaddrinfo, normalized_host, None)
-        except socket.gaierror as exc:
+        except (socket.gaierror, UnicodeError) as exc:
             raise URLValidationError(f"Could not resolve hostname: {hostname}") from exc
 
         if not addr_infos:
@@ -93,19 +94,23 @@ class URLValidator:
         if not normalized_url:
             raise URLValidationError("URL cannot be empty")
 
-        parsed = urllib.parse.urlparse(normalized_url)
+        try:
+            parsed = urllib.parse.urlparse(normalized_url)
+        except ValueError as exc:
+            raise URLValidationError("Invalid URL syntax") from exc
         if parsed.scheme.lower() not in {"http", "https"}:
             raise URLValidationError("URL scheme must be http or https")
 
         try:
             _ = parsed.port
+            hostname = parsed.hostname
         except ValueError as exc:
             raise URLValidationError("URL contains an invalid port") from exc
 
-        if not parsed.netloc or not parsed.hostname:
+        if not parsed.netloc or not hostname:
             raise URLValidationError("URL must include a valid hostname")
 
-        initial_hostname = parsed.hostname.lower()
+        initial_hostname = hostname.lower()
         validated_hosts: set[str] = set()
         if not self.allow_private_ips:
             await self._validate_host_ssrf(initial_hostname)
@@ -139,7 +144,7 @@ class URLValidator:
                 else:
                     status_code = resp.status_code
                     final_url = resp.url
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise URLValidationError(f"The provided URL is not accessible: {exc}") from exc
 
         if not self.allow_private_ips:

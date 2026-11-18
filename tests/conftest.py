@@ -22,6 +22,7 @@ def repo(tmp_path) -> URLRepository:
 def validator(monkeypatch: pytest.MonkeyPatch) -> URLValidator:
     def fake_getaddrinfo(host: str, port: object) -> list:
         normalized = host.lower().rstrip(".")
+        normalized.encode("idna")
         if normalized == "rebind.example.com":
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.20.30.40", 0))]
         if normalized.endswith(".invalid"):

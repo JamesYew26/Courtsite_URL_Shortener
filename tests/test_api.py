@@ -167,3 +167,48 @@ def test_key_collision_retries_before_succeeding(
         res = local_client.post("/shorten_url/", json={"url": "https://www.courtsite.my/new"})
     assert res.status_code == 201
     assert res.json()["key"] == "fresh99"
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://[::1/",
+        "https://..com/",
+        "https://example.com/foo\nbar",
+        "http://100.64.0.1/",
+    ],
+)
+def test_shorten_returns_400_for_malformed_idna_invalid_url_and_cgnat(client, bad_url: str):
+    res = client.post("/shorten_url/", json={"url": bad_url})
+    assert res.status_code == 400
+    assert res.json()["detail"]
+
+
+def test_shorten_missing_url_returns_422(client):
+    res = client.post("/shorten_url/", json={})
+    assert res.status_code == 422
+
+
+def test_self_referential_path_boundary_and_whitespace_ref_fallback(client):
+    r_exact = client.post(
+        "/shorten_url/",
+        json={"url": "http://testserver/shorten_url"},
+    )
+    assert r_exact.status_code == 400
+
+    r_similar = client.post(
+        "/shorten_url/",
+        json={"url": "http://testserver/shorten_url_guide"},
+    )
+    # testserver is not blocked by MockTransport/fake_getaddrinfo unless self-referential
+    assert r_similar.status_code == 201
+
+    created = client.post("/shorten_url/", json={"url": "https://www.courtsite.my/ref"}).json()
+    key = created["key"]
+    client.get(
+        f"/shorten_url/{key}?ref=%20%20%20",
+        headers={"Referer": "https://partner.example.com"},
+        follow_redirects=False,
+    )
+    stats = client.get(f"/shorten_url/{key}/stats").json()
+    assert stats["referrers"] == {"https://partner.example.com": 1}

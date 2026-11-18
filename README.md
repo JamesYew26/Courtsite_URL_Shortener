@@ -27,7 +27,7 @@ courtsite-url-shortener/
 │   ├── schemas.py       # Pydantic request & response models
 │   └── validator.py     # URL syntax, SSRF DNS/IP guard, and HTTP reachability validator
 ├── tests/
-│   ├── conftest.py      # Shared fixtures (in-memory SQLite + MockTransport validator)
+│   ├── conftest.py      # Shared fixtures (isolated tmp_path SQLite + MockTransport validator)
 │   ├── test_api.py      # End-to-end API, redirect, loop protection, and BI tests
 │   ├── test_keygen.py   # Base62 keygen, schema normalization, and settings tests
 │   ├── test_repository.py # SQLite persistence and BI aggregation tests
@@ -77,7 +77,7 @@ No external database server is required — the prototype persists data locally 
    .venv/bin/pytest -v
    ```
 
-   All tests run completely offline and deterministically using an in-memory SQLite database (`:memory:`) and `httpx.MockTransport`.
+   All tests run completely offline and deterministically using isolated temporary SQLite databases (`tmp_path` and `:memory:`) and `httpx.MockTransport`.
 
 ---
 
@@ -268,7 +268,7 @@ curl http://localhost:8000/analytics/locations
 1. **False-Negative `405`/`403` Responses on `HEAD` Validation:** Checking live URL accessibility with `HEAD` alone rejects valid public sites and CDNs that disallow `HEAD` requests (`405 Method Not Allowed` or `403 Forbidden`). Solving this required falling back to a streaming `GET` (`client.stream("GET", ...)`) when `HEAD` returns `405` or `403`, reading only the status code and final URL without buffering large payloads.
 2. **SSRF & Redirect-Based SSRF Risks:** Fetching user-supplied URLs server-side exposes internal metadata endpoints (`169.254.169.254`) and localhost/private services. Even if the initial URL resolves to a public IP, an attacker can serve a `302` redirect to `127.0.0.1`. We mitigated this by validating both literal IPs and `socket.getaddrinfo` DNS results against restricted IP ranges, hooking every `httpx` redirect request via `event_hooks`, and re-validating the final destination host.
 3. **Mobile QR Scanners Omitting HTTP `Referer` Headers:** Native iOS/Android camera QR scanners open links with no HTTP `Referer` header, making every physical scan look identical if tracked only by `Referer`. We addressed this in two ways: (a) assigning unique short keys per physical placement with `location`/`campaign` metadata, and (b) supporting a `?ref=` query parameter override on `GET /shorten_url/{key}` so posters or social links can pass explicit attribution tags.
-4. **Deterministic Offline Testing:** Testing live HTTP reachability and SSRF redirect guards without real network calls can be flaky or slow. Injecting `httpx.MockTransport` into `URLValidator` and `:memory:` SQLite into `URLRepository` keeps the entire 29-test suite deterministic and running in ~0.16s offline.
+4. **Deterministic Offline Testing:** Testing live HTTP reachability and SSRF redirect guards without real network calls can be flaky or slow. Injecting `httpx.MockTransport` into `URLValidator` and isolated temporary SQLite databases (`tmp_path` and `:memory:`) into `URLRepository` keeps the entire automated test suite deterministic and running offline.
 
 ### What assumptions did you make?
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import sqlite3
+import threading
 from typing import Any, Iterator, Optional
 
 from app.schemas import LocationStatsItem, URLStatsResponse, VisitRecord
@@ -28,20 +29,24 @@ class URLRepository:
 
     def __init__(self, db_path: str = "shortener.db") -> None:
         self.db_path = db_path
+        self._lock = threading.RLock()
         self._memory_conn: Optional[sqlite3.Connection] = None
         if db_path == ":memory:":
-            self._memory_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._memory_conn = sqlite3.connect(
+                ":memory:", check_same_thread=False, timeout=10.0
+            )
             self._memory_conn.row_factory = sqlite3.Row
             self._memory_conn.execute("PRAGMA foreign_keys = ON")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         if self._memory_conn is not None:
-            with self._memory_conn:
-                yield self._memory_conn
+            with self._lock:
+                with self._memory_conn:
+                    yield self._memory_conn
             return
 
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         try:
@@ -53,6 +58,8 @@ class URLRepository:
     def init_db(self) -> None:
         """Create database tables and indexes if they do not exist."""
         with self._connect() as conn:
+            if self.db_path != ":memory:":
+                conn.execute("PRAGMA journal_mode = WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS short_urls (

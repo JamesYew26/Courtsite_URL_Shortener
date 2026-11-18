@@ -12,7 +12,6 @@ from app.schemas import LocationStatsItem, ShortenRequest, ShortenResponse, URLS
 from app.validator import URLValidationError, URLValidator
 
 router = APIRouter()
-settings = Settings()
 
 MAX_KEY_COLLISION_RETRIES = 5
 
@@ -33,27 +32,37 @@ def get_validator(request: Request) -> URLValidator:
 
 def _extract_host_port(parsed: urllib.parse.ParseResult) -> Optional[Tuple[str, int]]:
     scheme = parsed.scheme.lower()
-    if scheme not in ("http", "https") or not parsed.hostname:
-        return None
     try:
+        hostname = parsed.hostname
         port = parsed.port
     except ValueError:
         return None
+    if scheme not in ("http", "https") or not hostname:
+        return None
     effective_port = port if port is not None else (443 if scheme == "https" else 80)
-    return (parsed.hostname.lower(), effective_port)
+    return (hostname.lower(), effective_port)
 
 
 def _is_self_referential_short_url(url: str, request: Request, base_url: str) -> bool:
-    parsed_target = urllib.parse.urlparse(url.strip())
-    if not parsed_target.path.startswith("/shorten_url"):
+    try:
+        parsed_target = urllib.parse.urlparse(url.strip())
+    except ValueError:
+        return False
+    if not (
+        parsed_target.path == "/shorten_url"
+        or parsed_target.path.startswith("/shorten_url/")
+    ):
         return False
 
     target_host_port = _extract_host_port(parsed_target)
     if target_host_port is None:
         return False
 
-    request_host_port = _extract_host_port(urllib.parse.urlparse(str(request.url)))
-    base_host_port = _extract_host_port(urllib.parse.urlparse(base_url))
+    try:
+        request_host_port = _extract_host_port(urllib.parse.urlparse(str(request.url)))
+        base_host_port = _extract_host_port(urllib.parse.urlparse(base_url))
+    except ValueError:
+        return False
     return target_host_port in {request_host_port, base_host_port}
 
 
@@ -86,7 +95,7 @@ async def shorten_url(
     validator: URLValidator = Depends(get_validator),
 ) -> ShortenResponse:
     """Validate and shorten a target URL, returning a unique key and short URL."""
-    app_settings: Settings = getattr(request.app.state, "settings", settings)
+    app_settings: Settings = getattr(request.app.state, "settings", None) or Settings()
 
     if _is_self_referential_short_url(payload.url, request, app_settings.base_url):
         raise HTTPException(
@@ -149,7 +158,8 @@ def redirect_short_url(
 
     client_ip = _extract_client_ip(request)
     user_agent = request.headers.get("user-agent")
-    referrer = request.query_params.get("ref") or request.headers.get("referer")
+    ref_param = (request.query_params.get("ref") or "").strip()
+    referrer = ref_param or request.headers.get("referer")
     visitor_hash = hashlib.sha256(
         f"{client_ip}:{user_agent or ''}".encode("utf-8")
     ).hexdigest()[:16]

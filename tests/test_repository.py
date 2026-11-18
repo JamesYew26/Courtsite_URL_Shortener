@@ -1,3 +1,6 @@
+import sqlite3
+import threading
+
 import pytest
 
 from app.repository import KeyCollisionError, URLRepository
@@ -158,3 +161,42 @@ def test_location_leaderboard_grouping_and_ordering(tmp_path):
     assert leaderboard[2].total_links == 2
     assert leaderboard[2].total_visits == 0
     assert leaderboard[2].unique_visits == 0
+
+
+def test_file_db_enables_wal_mode(tmp_path):
+    db_file = tmp_path / "wal.db"
+    repo = URLRepository(str(db_file))
+    repo.init_db()
+    with sqlite3.connect(str(db_file)) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
+
+
+def test_memory_repo_concurrent_access():
+    repo = URLRepository(":memory:")
+    repo.init_db()
+    repo.create_short_url("conc001", "https://courtsite.my/concurrent")
+    errors: list[Exception] = []
+
+    def worker(worker_id: int) -> None:
+        try:
+            for idx in range(20):
+                repo.record_visit(
+                    "conc001",
+                    visitor_hash=f"v_{worker_id}_{idx}",
+                    referrer=None,
+                    user_agent="ThreadTest",
+                )
+        except Exception as exc:  # pragma: no cover - test assertion catches failures
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    stats = repo.get_url_stats("conc001")
+    assert stats is not None
+    assert stats.total_visits == 80

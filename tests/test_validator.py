@@ -16,6 +16,7 @@ async def test_rejects_invalid_syntax_and_schemes() -> None:
         "ftp://files.example.com",
         "javascript:alert(1)",
         "http://",
+        "http://[::1/",
         "https://example.com:99999/bad-port",
         "   ",
         "",
@@ -38,6 +39,7 @@ async def test_rejects_ssrf_localhost_and_private_ips() -> None:
         "http://169.254.169.254/latest/meta-data/",
         "http://192.168.1.1/router",
         "http://10.0.0.1/internal",
+        "http://100.64.0.1/",
         "http://[::ffff:127.0.0.1]/admin",
     ]:
         with pytest.raises(URLValidationError, match="private|local|internal|restricted"):
@@ -138,3 +140,31 @@ async def test_rejects_ssrf_via_redirect() -> None:
         await validator.validate("https://93.184.216.34/redirect-internal")
 
     assert "127.0.0.1" not in requested_hosts
+
+
+@pytest.mark.asyncio
+async def test_rejects_idna_failure_httpx_invalid_url_and_bad_redirect_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_getaddrinfo(host: str, port: object) -> list:
+        host.encode("idna")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/bad-redirect":
+            return httpx.Response(302, headers={"Location": "http://[::1/"})
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+    validator = URLValidator(transport=transport, allow_private_ips=False)
+
+    with pytest.raises(URLValidationError, match="Could not resolve hostname"):
+        await validator.validate("https://..com/")
+
+    with pytest.raises(URLValidationError, match="not accessible"):
+        await validator.validate("https://example.com/foo\nbar")
+
+    with pytest.raises(URLValidationError, match="not accessible"):
+        await validator.validate("https://example.com/bad-redirect")
