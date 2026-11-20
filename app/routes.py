@@ -111,6 +111,17 @@ async def shorten_url(
             detail=exc.message,
         ) from exc
 
+    # Why generate a new unique key on every POST request (instead of deduplicating by URL)?
+    # Marketing places physical QR codes in different shopping malls (e.g., Suria KLCC vs.
+    # Mid Valley) pointing to the exact same destination URL (`https://www.courtsite.my`).
+    # Because mobile phone camera QR scanners do NOT send an HTTP `Referer` header showing
+    # the user's physical location, giving each request its own unique short key (and optional
+    # `location` / `campaign` metadata) is what enables per-location traffic attribution.
+    #
+    # Collision Handling:
+    # `short_urls.key` is a SQLite PRIMARY KEY (UNIQUE constraint). In the astronomically rare
+    # event that `generate_key()` collides with an existing key (1 in 3.52 trillion space),
+    # `repo.create_short_url` raises `KeyCollisionError` and we retry up to 5 times.
     record = None
     for _ in range(MAX_KEY_COLLISION_RETRIES):
         key = generate_key(app_settings.key_length)
@@ -156,6 +167,16 @@ def redirect_short_url(
             detail="Short URL key not found",
         )
 
+    # Privacy-Preserving Unique Visitor Fingerprinting:
+    # Why ONE-WAY HASH (SHA-256) of IP + User-Agent instead of storing raw IPs or cookies?
+    # 1. Privacy (GDPR/PDPA): Raw IP addresses are PII. Hashing (`sha256(ip:ua)[:16]`) is a
+    #    one-way cryptographic hash (NOT two-way encryption) — we can count distinct visitors
+    #    deterministically via `COUNT(DISTINCT visitor_hash)` without storing raw customer IPs.
+    # 2. Cookie-less reliability: Mobile browsers and in-app QR scanners frequently strip or
+    #    block redirect cookies, whereas IP and User-Agent are present on every HTTP GET request.
+    # 3. Tradeoff/Limitation: Two users on the same mall Wi-Fi NAT IP with the exact same phone
+    #    model/OS string share a hash (slight under-counting), while one user switching from
+    #    Mall Wi-Fi to 5G gets two hashes (slight over-counting).
     client_ip = _extract_client_ip(request)
     user_agent = request.headers.get("user-agent")
     ref_param = (request.query_params.get("ref") or "").strip()
@@ -171,6 +192,14 @@ def redirect_short_url(
         user_agent=user_agent,
     )
 
+    # Why HTTP 302 Found + Cache-Control: no-store instead of 301 Moved Permanently?
+    # 1. Analytics accuracy: Browsers cache `301 Moved Permanently` indefinitely. If a user
+    #    scans a QR code twice, a 301 redirect would make their browser jump straight to the
+    #    original URL from local cache on the second scan, bypassing our server and losing BI
+    #    visit counts. `302 Found` with `no-store, no-cache, must-revalidate` forces every
+    #    scan to hit our proxy endpoint.
+    # 2. Mutable destination: If a printed mall QR standee needs to be repointed to a new
+    #    campaign page later, 302 ensures phones haven't permanently cached the old target.
     return RedirectResponse(
         url=record["original_url"],
         status_code=status.HTTP_302_FOUND,

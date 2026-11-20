@@ -23,7 +23,17 @@ class URLValidationError(Exception):
 
 
 def _is_restricted_ip(ip_obj: IPAddress) -> bool:
-    """Return True if an IP address belongs to a restricted or non-public range."""
+    """Return True if an IP address belongs to a restricted or non-public range.
+
+    SSRF (Server-Side Request Forgery) Defense:
+    Because `POST /shorten_url/` makes a live server-side HTTP request to verify
+    the user-supplied URL is accessible, an attacker could pass an internal IP
+    (e.g., `http://127.0.0.1:8000/admin`, `http://192.168.1.1`, or AWS/GCP cloud
+    metadata `http://169.254.169.254/latest/meta-data/`) to probe our private network.
+    We block all loopback, private, link-local, multicast, reserved, unspecified,
+    and non-global (such as RFC 6598 CGNAT `100.64.0.0/10`) IP ranges, including
+    IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`).
+    """
     if (
         ip_obj.is_loopback
         or ip_obj.is_private
@@ -129,6 +139,18 @@ class URLValidator:
                 validated_hosts.add(req_host)
 
         try:
+            # Why HEAD first, then fallback to streaming GET?
+            # 1. HTTP HEAD asks the remote server for status code and headers ONLY,
+            #    without downloading the response body. This saves bandwidth and latency
+            #    (especially if the target URL points to a large page or media file).
+            # 2. However, some web servers, CDNs, and anti-bot firewalls reject HEAD
+            #    requests with 405 Method Not Allowed or 403 Forbidden even when the
+            #    page loads fine in a browser.
+            # 3. When 405 or 403 occurs on HEAD, we fall back to `client.stream("GET", ...)`,
+            #    which reads only the response status/headers and immediately closes the
+            #    connection stream without downloading the full response body.
+            # 4. The `_guard_redirect_request` event hook re-runs our SSRF check on every
+            #    redirect hop so a public URL cannot redirect (302) into an internal IP.
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=self.timeout,
