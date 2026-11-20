@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 *.pyc
 *.db
+*.db-shm
+*.db-wal
 .superpowers/
 INTERVIEW_GUIDE.md
 docs/INTERVIEW_GUIDE.md
